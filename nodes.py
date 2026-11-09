@@ -7,7 +7,7 @@ finish the schedule at full resolution.
 
 Two front-ends share the same engine:
 - SelfLiftAvatarH3Sampler: MiniMax H3 audio-video (nested AV latents; the audio stream
-  has no spatial dimensions and continues through the reused Euler boundary step).
+  has no spatial dimensions and retains its sampled state at the boundary).
   This is an experimental extension beyond the paper's image-model evaluation.
 - SelfLiftAvatarImageSampler: compatible rectified-flow image models.
 """
@@ -119,10 +119,15 @@ def _pack(streams, nested):
 def _validate_sampling(model_sampling, sampler):
     if not isinstance(model_sampling, comfy.model_sampling.CONST):
         raise ValueError("SelfLift requires a rectified-flow model")
-    if not isinstance(sampler, comfy.samplers.KSAMPLER) or sampler.sampler_function is not comfy.k_diffusion.sampling.sample_euler:
-        raise ValueError("SelfLift requires the standard Euler sampler")
-    if sampler.extra_options.get("s_churn", 0.0) != 0.0:
-        raise ValueError("SelfLift requires Euler with s_churn=0")
+    if not callable(getattr(sampler, "sample", None)):
+        raise ValueError("SelfLift requires a ComfyUI SAMPLER")
+
+
+def _uses_euler_transition(sampler):
+    return (isinstance(sampler, comfy.samplers.KSAMPLER)
+            and type(sampler).sample is comfy.samplers.KSAMPLER.sample
+            and sampler.sampler_function is comfy.k_diffusion.sampling.sample_euler
+            and sampler.extra_options.get("s_churn", 0.0) == 0.0)
 
 
 def _validate_schedule(sigmas, transition_step):
@@ -229,6 +234,10 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
     if not 0.0 <= w_min <= w_max <= 1.0:
         raise ValueError("selflift-Avatar: weights must satisfy 0 <= w_min <= w_max <= 1")
     noise_masks = _validate_latent_input(latent_image)
+    if noise_masks is not None and (
+            not isinstance(sampler, comfy.samplers.KSAMPLER)
+            or type(sampler).sample is not comfy.samplers.KSAMPLER.sample):
+        raise ValueError("selflift-Avatar: noise_mask requires the standard ComfyUI KSAMPLER sample interface")
     global_tiling = (highres_tiling and isinstance(highres_tiling_mode, str)
                      and highres_tiling_mode in _GLOBAL_TILING_MODES)
     if spatial_anchor_mode not in ("off", "lowres_global"):
@@ -274,6 +283,10 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
         latent_image.get("downscale_ratio_temporal", None)))
     hires_base = high_res_model if high_res_model is not None else model
     _validate_sampling(hires_base.get_model_object("model_sampling"), sampler)
+    reuse_euler = _uses_euler_transition(sampler)
+    if not reuse_euler:
+        logging.info("[selflift-Avatar sampler] generic transition: one extra low-resolution "
+                     "prediction; sampler history restarts at the resolution boundary")
     if highres_tiling and highres_tiling_mode == "spatial":
         high_model = h3_tiling.tiled_model(hires_base, [tuple(stream.shape) for stream in streams],
                                            mode=tiling_mode, tiles=tiling_tiles, axis=tiling_axis,
@@ -307,11 +320,11 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
     w = max(2, round(W * lowres_scale / 2) * 2)
     low_shape = (b, c, t, h, w) if video else (b, c, h, w)
     logging.info("[selflift-Avatar plan] low_latent=%s target_latent=%s spatial_lift=(%.4f, %.4f) "
-                 "low_nfe=%d high_nfe=%d sigma_prediction=%.8g sigma_resume=%.8g "
+                 "low_steps=%d high_steps=%d sigma_prediction=%.8g sigma_resume=%.8g "
                  "rho=%.4f weights=(%.4f, %.4f) direct_lift=%s pixel_anchor=%s cfg=%.4f mask=%s hires_model=%s",
                  low_shape, tuple(streams[0].shape), H / h, W / w,
                  transition_step, sigmas.numel() - 1 - transition_step,
-                 sigmas[transition_step - 1].item(), sigmas[transition_step].item(),
+                 sigmas[transition_step - 1 if reuse_euler else transition_step].item(), sigmas[transition_step].item(),
                  rho, w_min, w_max,
                  "skipped" if rho == 1.0 and w_min == 1.0 else "external" if latent_lifter is not None else latent_upsample,
                  rho > 0.0 and w_max > 0.0, cfg,
@@ -358,11 +371,11 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
 
     def callback_low(step, x0, x, total):
         nonlocal low_evaluations
-        step = low_evaluations
         low_evaluations += 1
-        if low_evaluations > transition_step:
+        step = low_evaluations - 1 if reuse_euler else min(max(int(step), 0), transition_step - 1)
+        if reuse_euler and low_evaluations > transition_step:
             raise RuntimeError("selflift-Avatar: too many low-resolution callbacks for the Euler schedule")
-        if step == transition_step - 1:
+        if reuse_euler and step == transition_step - 1:
             transition["state"] = x
             transition["x0"] = x0
         # Preview decoders expect the target grid.  Decode a temporary lifted
@@ -384,27 +397,60 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
         low_timer.mark(f"step {step + 1}/{transition_step}" + (" (includes setup)" if step == 0 else ""))
         return result
 
-    # The final low-resolution model evaluation is the Eq. 3 prediction. Its Euler
-    # update is discarded and rebuilt after the resolution transition, preserving NFE.
+    # Standard Euler reuses its last prediction. Other solvers finish their low-res
+    # schedule before a separate prediction at the boundary, keeping their true state.
     resolution_scale = (getattr(model.get_model_object("latent_format"), "spacial_downscale_ratio", 1)
                         if video else getattr(model.get_model_object("latent_format"), "spacial_downscale_ratio", 1))
     low_timer = _StageTimer("low_resolution", low_model.load_device, (h, w), resolution_scale)
     log_memory("low_resolution start", low_model.load_device)
-    comfy.samplers.sample(low_model, noise_low, positive_low, negative_low, cfg, low_model.load_device,
-                          sampler, sigmas[:transition_step + 1], low_model.model_options,
-                          latent_image=low_latent, callback=callback_low,
-                          disable_pbar=disable_pbar, seed=seed)
-    if low_evaluations != transition_step:
+    low_sampled = comfy.samplers.sample(low_model, noise_low, positive_low, negative_low, cfg, low_model.load_device,
+                                       sampler, sigmas[:transition_step + 1], low_model.model_options,
+                                       latent_image=low_latent, callback=callback_low,
+                                       disable_pbar=disable_pbar, seed=seed)
+    if reuse_euler and low_evaluations != transition_step:
         raise RuntimeError(f"selflift-Avatar: expected {transition_step} low-resolution callbacks, received {low_evaluations}; check sampler wrappers")
+    if not reuse_euler:
+        def capture_endpoint(step, x0, x, total):
+            transition["x0"] = x0
+
+        endpoint_streams, _ = _streams(low_sampled)
+        endpoint_noise = _pack([torch.zeros_like(s) for s in endpoint_streams], nested)
+        endpoint_sigmas = torch.stack((sigmas[transition_step], sigmas.new_zeros(())))
+        endpoint_sampler = comfy.samplers.sampler_object("euler")
+        if noise_masks is not None:
+            endpoint_inpaint_noise = (comfy.utils.pack_latents(noise_low.unbind())[0]
+                                      if nested else noise_low)
+
+            def sample_endpoint(model_k, x, sigmas, **kwargs):
+                model_k.noise = endpoint_inpaint_noise.to(x)
+                return comfy.k_diffusion.sampling.sample_euler(model_k, x, sigmas, **kwargs)
+
+            endpoint_sampler = comfy.samplers.KSAMPLER(sample_endpoint)
+        comfy.samplers.sample(low_model, endpoint_noise, positive_low, negative_low, cfg, low_model.load_device,
+                              endpoint_sampler, endpoint_sigmas, low_model.model_options,
+                              latent_image=low_sampled, callback=capture_endpoint,
+                              disable_pbar=True, seed=seed)
+        if "x0" not in transition:
+            raise RuntimeError("selflift-Avatar: missing low-resolution transition prediction; check sampler wrappers")
+        del endpoint_streams, endpoint_noise, endpoint_sampler
+        if noise_masks is not None:
+            del endpoint_inpaint_noise
+        low_timer.mark("boundary prediction (one extra low-resolution evaluation)")
     low_timer.finish()
     log_memory("low_resolution end", model.load_device)
     transition_timer = _StageTimer("transition", model.load_device, (H, W), resolution_scale)
-    low_streams, nested = _streams(transition.pop("state"))
     x0_streams, _ = _streams(transition.pop("x0"))
-    sigma_k = sigmas[transition_step - 1]
+    sigma_k = sigmas[transition_step - 1 if reuse_euler else transition_step]
     sigma_next = sigmas[transition_step]
-    auxiliary_next = [_euler_step(state.to(device), denoised.to(device), sigma_k, sigma_next)
-                      for state, denoised in zip(low_streams[1:], x0_streams[1:])]
+    if reuse_euler:
+        low_streams, _ = _streams(transition.pop("state"))
+        auxiliary_resume = [model_sampling.inverse_noise_scaling(
+            sigma_next, _euler_step(state.to(device), denoised.to(device), sigma_k, sigma_next))
+            for state, denoised in zip(low_streams[1:], x0_streams[1:])]
+    else:
+        low_streams, _ = _streams(model.model.process_latent_in(low_sampled))
+        auxiliary_resume = [state.to(device) for state in low_streams[1:]]
+    del low_sampled
     latent_format = model.get_model_object("latent_format")
     z0_low_vae = latent_format.process_out(x0_streams[0].float()).to(device)
     # Keep the aligned low-resolution endpoint as an optional global H3
@@ -450,17 +496,18 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
     transition_timer.mark("correction_and_debug")
     log_memory("transition correction_ready", model.load_device)
 
-    # Re-noise the corrected video/image endpoint at the sigma of the reused model
-    # evaluation, then complete that Euler interval without another denoiser call.
+    # Reuse the Euler boundary interval, or re-noise directly at the completed
+    # low-resolution schedule's ending sigma for other solvers.
     video_noise = comfy.sample.prepare_noise(z0_high, (seed + 1) % (1 << 64),
                                              latent_image.get("batch_index", None)).to(z0_high)
     video_state = model_sampling.noise_scaling(sigma_k, video_noise, z0_high)
-    next_streams = [_euler_step(video_state, z0_high, sigma_k, sigma_next)] + auxiliary_next
-    del z0_high, video_noise, video_state, auxiliary_next
-    resume_streams = [model_sampling.inverse_noise_scaling(sigma_next, s) for s in next_streams]
+    if reuse_euler:
+        video_state = _euler_step(video_state, z0_high, sigma_k, sigma_next)
+    resume_streams = [model_sampling.inverse_noise_scaling(sigma_next, video_state)] + auxiliary_resume
+    del z0_high, video_noise, video_state, auxiliary_resume
     resume_latent = model.model.process_latent_out(_pack(resume_streams, nested))
     resume_noise = _pack([torch.zeros_like(s) for s in resume_streams], nested)
-    del next_streams, resume_streams
+    del resume_streams
     transition_timer.mark("renoise")
     transition_timer.finish()
     log_memory("transition end / high_resolution start", model.load_device)
@@ -469,9 +516,9 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
 
     def callback_high(step, x0, x, total):
         nonlocal high_evaluations
-        step = high_evaluations
         high_evaluations += 1
-        if high_evaluations > total_steps - transition_step:
+        step = high_evaluations - 1 if reuse_euler else min(max(int(step), 0), total_steps - transition_step - 1)
+        if reuse_euler and high_evaluations > total_steps - transition_step:
             raise RuntimeError("selflift-Avatar: too many high-resolution callbacks for the Euler schedule")
         result = callback(step + transition_step, x0, x, total_steps)
         high_timer.mark(f"step {step + 1}/{total_steps - transition_step}" + (" (includes setup)" if step == 0 else ""))
@@ -498,7 +545,7 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
                                 latent_image=resume_latent, callback=callback_high,
                                 disable_pbar=disable_pbar, seed=seed)
     del resume_latent, resume_noise, lowres_anchor, positive_high
-    if high_evaluations != total_steps - transition_step:
+    if reuse_euler and high_evaluations != total_steps - transition_step:
         raise RuntimeError(f"selflift-Avatar: expected {total_steps - transition_step} high-resolution callbacks, received {high_evaluations}; check sampler wrappers")
 
     result = latent_image.copy()
@@ -526,16 +573,16 @@ class SelfLiftAvatarH3Sampler:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "low_res_model": ("MODEL", {"tooltip": "Low-resolution model used for the first transition_step evaluations. Also used for the high-resolution stage when high_res_model is disconnected."}),
+            "low_res_model": ("MODEL", {"tooltip": "低分辨率阶段使用的模型；高分辨率模型未连接时也用于高分辨率阶段。"}),
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "vae": ("VAE", {"tooltip": "Video VAE used for the pixel re-encode anchor at the resolution transition."}),
             "latent_image": ("LATENT", {"tooltip": "Target-resolution H3 AV latent defining size and duration. Experimental: accepts existing latents, Tensor masks and H3 NestedTensor video/audio masks. 0 keeps content; 1 generates. Spatial tiling requires video=1 everywhere and audio=0 everywhere; global modes keep full-sequence masks unchanged."}),
-            "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
+            "sampler": ("SAMPLER", {"tooltip": "支持 ComfyUI 采样器。标准 Euler 且 s_churn=0 时复用切换预测；其他采样器在切换处增加一次低分辨率预测，并重建采样历史。实际兼容性取决于模型和采样器。"}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             "cfg": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
-            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "Number of low-resolution denoiser evaluations. The paper uses 6 of 8 NFEs for its 8-step image model; H3 requires independent validation."}),
+            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "低分辨率阶段的 sigma 区间数。其他采样器在切换处额外预测一次；多次评估或自适应采样器的模型调用数不等于步数。"}),
             "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix (paper: 0.5)."}),
             "rho": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of highest-risk spatiotemporal locations corrected toward the pixel-VAE anchor. The H3 default 0 uses only the external latent upscaler and skips the VAE round trip. For SelfLift-zero with upscaler_model=none, start near 0.6."}),
             "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength floor. H3's widespread nearest-lift error can require 1.0; 0.5 is the paper's image-model setting."}),
@@ -760,16 +807,16 @@ class SelfLiftAvatarImageSampler:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "low_res_model": ("MODEL", {"tooltip": "Low-resolution model used for the first transition_step evaluations. Also used for the high-resolution stage when high_res_model is disconnected."}),
+            "low_res_model": ("MODEL", {"tooltip": "低分辨率阶段使用的模型；高分辨率模型未连接时也用于高分辨率阶段。"}),
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "vae": ("VAE", {"tooltip": "VAE used for the pixel re-encode anchor at the resolution transition."}),
             "latent_image": ("LATENT", {"tooltip": "Target-resolution image latent. Experimental: accepts existing content and BHW/BCHW Tensor masks. 0 keeps content; 1 generates."}),
-            "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
+            "sampler": ("SAMPLER", {"tooltip": "支持 ComfyUI 采样器。标准 Euler 且 s_churn=0 时复用切换预测；其他采样器在切换处增加一次低分辨率预测，并重建采样历史。实际兼容性取决于模型和采样器。"}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
-            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "Number of low-resolution denoiser evaluations. Paper: 3 of 4 for FLUX.2-Klein, 6 of 8 for Z-Image-Turbo."}),
+            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "低分辨率阶段的 sigma 区间数。其他采样器在切换处额外预测一次；多次评估或自适应采样器的模型调用数不等于步数。"}),
             "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix (paper: 0.5)."}),
             "rho": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of locations corrected toward the pixel-VAE anchor. Paper: 0.4 for FLUX.2-Klein, 0.3 for Z-Image-Turbo."}),
             "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),

@@ -352,7 +352,7 @@ class PipelineTests(unittest.TestCase):
         executor = comfy.patcher_extension.WrapperExecutor.new_class_executor(outer,SimpleNamespace(model_patcher=model),wrappers)
         out = executor.execute(eps,raw,sampler,sigmas,None,callback,disable_pbar,seed,latent_shapes=shapes)
         return NestedTensor(comfy.utils.unpack_latents(out,shapes))
-    def run_pipeline(self, mask, rho=0., tiling=False, low_res_model=None, **tiling_options):
+    def run_pipeline(self, mask, rho=0., tiling=False, low_res_model=None, sampler=None, **tiling_options):
         low_res_model = low_res_model if low_res_model is not None else Patcher()
         latent = {'samples':NestedTensor([self.v,self.a]), 'tag':'preserved'}
         if mask is not None:
@@ -364,8 +364,89 @@ class PipelineTests(unittest.TestCase):
              patch.object(nodes.latent_preview,'prepare_callback',return_value=lambda *a:None), \
              patch.object(nodes,'log_memory'), \
              patch.object(nodes.selflift,'paired_lifts',side_effect=lift):
-            return nodes.progressive_sample(low_res_model,[],[],None,latent,comfy.samplers.sampler_object('euler'),
+            return nodes.progressive_sample(low_res_model,[],[],None,latent,
+                sampler if sampler is not None else comfy.samplers.sampler_object('euler'),
                 torch.tensor([1.,.75,.5,.25,0.]),42,1.,2,.5,rho,1.,1.,'nearest',highres_tiling=tiling, **tiling_options)
+    def check_generic_transition(self, sampler, expected_callbacks=(2,1,2), mask=None, tiling=False):
+        inputs, outputs = [], []
+        original_sample = self.sample
+        def record(*args, **kwargs):
+            inputs.append(kwargs['latent_image'])
+            out = original_sample(*args, **kwargs)
+            outputs.append(out)
+            return out
+        with patch.object(self, 'sample', side_effect=record):
+            result = self.run_pipeline(mask, sampler=sampler, tiling=tiling)
+        self.assertEqual(self.stages, list(expected_callbacks))
+        self.assertEqual(self.stage_shapes, [(2,24,3,4,4), (2,24,3,4,4), (2,24,3,8,8)])
+        torch.testing.assert_close(self.stage_sigmas[0], torch.tensor([1.,.75,.5]))
+        torch.testing.assert_close(self.stage_sigmas[1], torch.tensor([.5,0.]))
+        torch.testing.assert_close(self.stage_sigmas[2], torch.tensor([.5,.25,0.]))
+        torch.testing.assert_close(inputs[1].unbind()[1], outputs[0].unbind()[1])
+        torch.testing.assert_close(inputs[2].unbind()[1], outputs[0].unbind()[1])
+        self.assertEqual(result['tag'], 'preserved')
+        for stream in result['samples'].unbind():
+            self.assertTrue(torch.isfinite(stream).all())
+        return result
+    def test_heun_transition_preserves_sampled_audio(self):
+        self.check_generic_transition(comfy.samplers.sampler_object('heun'))
+        self.assertEqual(len(self.audio_inputs), 8)  # 4 low + 1 boundary + 3 high evaluations
+    def test_multistep_transition(self):
+        self.check_generic_transition(comfy.samplers.sampler_object('res_multistep'))
+    def test_ancestral_transition(self):
+        self.check_generic_transition(comfy.samplers.sampler_object('euler_ancestral'))
+    def test_euler_churn_uses_generic_transition(self):
+        sampler = comfy.samplers.ksampler('euler', extra_options={'s_churn': .2})
+        self.check_generic_transition(sampler)
+    def test_generic_sampler_without_callbacks(self):
+        def without_callbacks(model, x, sigmas, extra_args=None, callback=None, disable=None):
+            return comfy.k_diffusion.sampling.sample_euler(
+                model, x, sigmas, extra_args=extra_args, callback=None, disable=disable)
+        self.check_generic_transition(comfy.samplers.KSAMPLER(without_callbacks), (0,1,0))
+    def test_generic_sampler_with_extra_callbacks(self):
+        def repeated_callbacks(model, x, sigmas, extra_args=None, callback=None, disable=None):
+            def report(info):
+                callback(dict(info, i=info['i'] * 2))
+                callback(dict(info, i=info['i'] * 2 + 1))
+            return comfy.k_diffusion.sampling.sample_euler(
+                model, x, sigmas, extra_args=extra_args, callback=report, disable=disable)
+        self.check_generic_transition(comfy.samplers.KSAMPLER(repeated_callbacks), (4,1,4))
+    def test_generic_transition_keeps_masked_audio_with_tiling(self):
+        mask = NestedTensor([torch.ones_like(self.v), torch.zeros_like(self.a)])
+        result = self.check_generic_transition(comfy.samplers.sampler_object('heun'), mask=mask, tiling=True)
+        torch.testing.assert_close(result['samples'].unbind()[1], self.a, rtol=0, atol=0)
+    def test_generic_transition_still_requires_flow_model(self):
+        with self.assertRaisesRegex(ValueError, 'rectified-flow'):
+            nodes._validate_sampling(object(), comfy.samplers.sampler_object('heun'))
+    def test_boundary_prediction_keeps_original_inpaint_noise(self):
+        prepared, observed = [], []
+        prepare_noise = nodes.comfy.sample.prepare_noise
+        sample_euler = comfy.k_diffusion.sampling.sample_euler
+        def prepare(*args, **kwargs):
+            noise = prepare_noise(*args, **kwargs)
+            prepared.append(noise)
+            return noise
+        def observe(model_k, x, sigmas, **kwargs):
+            observed.append(model_k.noise.clone())
+            return sample_euler(model_k, x, sigmas, **kwargs)
+        mask = NestedTensor([torch.ones_like(self.v), torch.zeros_like(self.a)])
+        with patch.object(nodes.comfy.sample, 'prepare_noise', side_effect=prepare), \
+             patch.object(comfy.k_diffusion.sampling, 'sample_euler', side_effect=observe):
+            self.check_generic_transition(comfy.samplers.sampler_object('heun'), mask=mask)
+        self.assertEqual(len(observed), 1)
+        expected = comfy.utils.pack_latents(prepared[0].unbind())[0]
+        torch.testing.assert_close(observed[0], expected)
+    def test_mask_rejects_incompatible_custom_sampler_interface(self):
+        sampler = SimpleNamespace(sample=lambda *args, **kwargs: None)
+        with self.assertRaisesRegex(ValueError, 'noise_mask.*KSAMPLER'):
+            self.run_pipeline(torch.ones_like(self.v), sampler=sampler)
+    def test_mask_rejects_overridden_ksampler_interface(self):
+        class CustomSampler(comfy.samplers.KSAMPLER):
+            def sample(self, *args, **kwargs):
+                raise AssertionError('自定义采样逻辑不应被静默绕过')
+        sampler = CustomSampler(comfy.k_diffusion.sampling.sample_euler)
+        with self.assertRaisesRegex(ValueError, 'noise_mask.*KSAMPLER'):
+            self.run_pipeline(torch.ones_like(self.v), sampler=sampler)
     def test_separate_stage_models(self):
         low, high = Patcher(), Patcher()
         high.load_device = torch.device('cpu:0')

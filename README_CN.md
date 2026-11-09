@@ -217,7 +217,16 @@ git pull --ff-only
 | `SelfLiftAvatarImageSampler` | selflift-Avatar Sampler (Image) |
 | `SelfLiftAvatarH3TST` | selflift-Avatar H3 TST |
 
-采样器使用标准的 `sampler` 和 `sigmas` 输入。请使用标准 Euler，并保持 `s_churn=0`。
+采样器使用标准的 `sampler` 和 `sigmas` 输入，已解除仅允许 Euler 的限制，可在 `KSamplerSelect` 中选择其他采样器。
+
+- 标准 `euler` 且 `s_churn=0` 保留原有预测复用路径，不增加模型评估次数。
+- 其他采样器完整执行低分辨率阶段，在切换点额外做一次低分辨率去噪预测用于放大，再从该 sigma 开始高分辨率采样。音频沿用低分辨率采样器实际计算的状态。
+- `transition_step` 表示低分辨率阶段的 sigma 区间数；Heun 等每步可能评估多次，自适应采样器的实际调用数由自身算法决定。多步法的历史和随机采样器的内部状态会在分辨率切换后重新建立，结果不等同于一次连续采样。
+- 这解除的是项目的采样器白名单，不保证所有模型与采样器组合兼容；仍要求 rectified-flow 模型。新增通用路径尚未完成真实模型验证。
+- 带 `noise_mask` 时，采样器需使用标准 ComfyUI `KSAMPLER.sample` 接口；不兼容或重写该接口的自定义采样器会提前报错。`KSamplerSelect` 提供的标准采样器不受这一接口检查影响。
+- 与 TST 组合时，额外边界预测按单步日程计算 TST 权重，可能与 Euler 原路径的权重不同。
+
+更新后重启 ComfyUI 后端，即可切换采样器；节点输入和已有连线不变。
 
 ## 测试节点：空间分块 + 全帧低清锚定
 

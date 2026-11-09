@@ -221,7 +221,7 @@ The original `comfyui-SelfLift` folder can remain installed; this project uses d
 | `SelfLiftAvatarImageSampler` | selflift-Avatar Sampler (Image) |
 | `SelfLiftAvatarH3TST` | selflift-Avatar H3 TST |
 
-The sampler uses the standard `sampler` and `sigmas` inputs. Use the standard Euler sampler with `s_churn=0`.
+采样器使用标准的 `sampler` 和 `sigmas` 输入，已解除仅允许 Euler 的限制。标准 `euler` 且 `s_churn=0` 保留原有预测复用路径；其他采样器在切换点增加一次低分辨率预测，音频沿用实际低分辨率采样结果，高分辨率阶段重新建立采样历史与随机采样器的内部状态。`transition_step` 表示 sigma 区间数，不保证等于模型调用数。仍要求 rectified-flow 模型；新增通用路径尚未完成真实模型验证，具体模型与采样器的兼容性需要实际确认。更新后重启 ComfyUI 后端。详见[采样器使用说明](README_CN.md#节点)。
 
 ### Spatial tiling refinement
 
