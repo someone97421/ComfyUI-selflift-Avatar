@@ -101,7 +101,7 @@ def _upscaler_input():
     h3_models = [name for name in models[1:] if "h3" in name.lower()]
     default = h3_models[0] if h3_models else "none"
     return (models, {"default": default,
-                     "tooltip": "External H3 latent upscaler (models/latent_upscale_models). The first detected H3 model is selected by default; 'none' uses nearest-neighbor lifting."})
+                     "tooltip": "H3 潜空间放大模型，来自 models/latent_upscale_models。默认选择检测到的第一个 H3 模型；选择 none 时使用最近邻升采样。"})
 
 
 def _streams(samples):
@@ -573,30 +573,30 @@ class SelfLiftAvatarH3Sampler:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "low_res_model": ("MODEL", {"tooltip": "低分辨率阶段使用的模型；高分辨率模型未连接时也用于高分辨率阶段。"}),
+            "low_res_model": ("MODEL", {"tooltip": "高噪声阶段使用的模型。低噪声阶段模型未连接时，也会继续用于低噪声阶段。"}),
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
-            "vae": ("VAE", {"tooltip": "Video VAE used for the pixel re-encode anchor at the resolution transition."}),
-            "latent_image": ("LATENT", {"tooltip": "Target-resolution H3 AV latent defining size and duration. Experimental: accepts existing latents, Tensor masks and H3 NestedTensor video/audio masks. 0 keeps content; 1 generates. Spatial tiling requires video=1 everywhere and audio=0 everywhere; global modes keep full-sequence masks unchanged."}),
-            "sampler": ("SAMPLER", {"tooltip": "支持 ComfyUI 采样器。标准 Euler 且 s_churn=0 时复用切换预测；其他采样器在切换处增加一次低分辨率预测，并重建采样历史。实际兼容性取决于模型和采样器。"}),
+            "vae": ("VAE", {"tooltip": "在噪声阶段切换时，用于像素空间重编码锚点的视频 VAE。"}),
+            "latent_image": ("LATENT", {"tooltip": "定义目标尺寸和时长的 H3 音视频潜变量。也支持已有潜变量、Tensor 遮罩以及 H3 NestedTensor 音视频遮罩；0 表示保留内容，1 表示生成内容。空间分块要求视频遮罩全为 1、音频遮罩全为 0；全局模式会保留完整序列遮罩。"}),
+            "sampler": ("SAMPLER", {"tooltip": "支持 ComfyUI 采样器。标准 Euler 且 s_churn=0 时复用切换预测；其他采样器会在切换处增加一次高噪声阶段预测，并重建采样历史。实际兼容性取决于模型和采样器。"}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             "cfg": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
-            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "低分辨率阶段的 sigma 区间数。其他采样器在切换处额外预测一次；多次评估或自适应采样器的模型调用数不等于步数。"}),
-            "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix (paper: 0.5)."}),
-            "rho": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of highest-risk spatiotemporal locations corrected toward the pixel-VAE anchor. The H3 default 0 uses only the external latent upscaler and skips the VAE round trip. For SelfLift-zero with upscaler_model=none, start near 0.6."}),
-            "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength floor. H3's widespread nearest-lift error can require 1.0; 0.5 is the paper's image-model setting."}),
-            "w_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Correction-strength ceiling. Keep at 1.0 for the H3 SelfLift-zero diagnostic."}),
+            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "高噪声阶段包含的 sigma 区间数量。其他采样器会在切换处额外预测一次；多次评估或自适应采样器的模型调用次数不等于步数。"}),
+            "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "高噪声阶段使用的空间尺寸比例，论文默认值为 0.5。"}),
+            "rho": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "向像素 VAE 锚点修正的最高风险时空位置比例。H3 默认值 0 仅使用外部潜变量放大模型，不执行 VAE 往返；当 upscaler_model=none 时，建议从 0.6 附近开始。"}),
+            "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "修正强度下限。H3 的大范围最近邻升采样误差可能需要设为 1.0；0.5 是图像模型论文设置。"}),
+            "w_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "修正强度上限。用于 SelfLift-zero 诊断时保持为 1.0。"}),
             "upscaler_model": _upscaler_input(),
         }, "optional": {
-            "high_res_model": ("MODEL", {"tooltip": "高分辨率阶段模型 / High-resolution model. Used after the resolution lift. If disconnected, uses low_res_model. Both stages must use compatible architecture, latent format, sampling parameterization, VAE and conditioning."}),
-            "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率省显存：开启", "label_off": "高分辨率省显存：关闭", "tooltip": "Experimental high-resolution memory saving. Choose Spatial for crop tiles, or Global stream/Global for full-sequence chunking that preserves cross-tile attention context. Spatial supports only video=1 everywhere / audio=0 everywhere; global modes keep arbitrary full-sequence masks."}),
-            "tiling_mode": (["auto", "manual"], {"default": "auto", "tooltip": "Spatial mode only. auto 自动: choose 1–8 tiles using memory estimates. manual 手动: use tiling_tiles, no automatic increase."}),
-            "tiling_tiles": ([2, 4, 6, 8], {"default": 2, "tooltip": "Spatial mode only. Manual tiles: 2, 4, 6, 8. Ignored in auto mode. Small dimensions can reduce the effective count."}),
-            "tiling_axis": (["auto", "width", "height"], {"default": "auto", "tooltip": "Spatial mode only. auto = longer patch-grid side; width = left/right strips; height = top/bottom strips; audio/time are not split."}),
-            "highres_tiling_mode": (["spatial", "global_stream", "global", "global_ram"], {"default": "spatial", "tooltip": "Memory-saving strategy. spatial: crop tiles with an automatic full-frame low-resolution anchor, content-aware cuts and seam diagnostics. global_stream: full-sequence context, GPU head groups, requires native SLA/sol-attn (VSA not adapted). global: full-sequence dense-compatible path; higher VRAM. global_ram: full-sequence host-RAM staging; slower. Global modes preserve the complete video/audio mask on the packed sequence."}),
-            "highres_token_chunk": ("INT", {"default": 4096, "min": 128, "max": 16384, "step": 128, "tooltip": "Global modes only. Tokens per projection/feed-forward batch. Smaller batches usually save intermediate VRAM but add overhead. This is not a spatial tile or attention window."}),
-            "highres_weight_cache_gb": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 64.0, "step": 0.5, "tooltip": "Global stream only. Resident DynamicVRAM weight-cache budget in GiB. Not total VRAM or system RAM. 0 keeps the automatic policy; it does not disable caching."}),
+            "high_res_model": ("MODEL", {"tooltip": "低噪声阶段使用的模型，在分辨率提升后运行。未连接时使用高噪声阶段模型。两个阶段必须兼容架构、潜变量格式、采样参数化方式、VAE 和条件输入。"}),
+            "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "低噪声阶段省显存：开启", "label_off": "低噪声阶段省显存：关闭", "tooltip": "实验性的低噪声阶段省显存功能。空间模式会裁剪分块；全局流和全局模式会按完整序列分批处理，并保留跨块注意力上下文。空间模式要求视频遮罩全为 1、音频遮罩全为 0；全局模式保留完整序列遮罩。"}),
+            "tiling_mode": (["auto", "manual"], {"default": "auto", "tooltip": "仅用于空间模式。auto 自动根据显存估算选择 1 至 8 块；manual 手动使用 tiling_tiles，不会自动增加分块数量。"}),
+            "tiling_tiles": ([2, 4, 6, 8], {"default": 2, "tooltip": "仅用于空间模式。手动分块数量可选 2、4、6、8；自动模式会忽略此项。尺寸较小时实际分块数量可能减少。"}),
+            "tiling_axis": (["auto", "width", "height"], {"default": "auto", "tooltip": "仅用于空间模式。auto 沿图像块网格较长的一边分块；width 分成左右条带；height 分成上下条带；音频和时间维度不会拆分。"}),
+            "highres_tiling_mode": (["spatial", "global_stream", "global", "global_ram"], {"default": "spatial", "tooltip": "省显存策略。spatial 使用带完整高噪声锚点的空间分块、内容感知切线和接缝诊断；global_stream 保留完整序列上下文并分组处理 GPU 注意力头，需要原生 SLA/sol-attn 支持；global 使用兼容性更高的完整序列路径，但显存占用更大；global_ram 使用主机内存分批处理，速度更慢。全局模式会保留打包序列中的完整音视频遮罩。"}),
+            "highres_token_chunk": ("INT", {"default": 4096, "min": 128, "max": 16384, "step": 128, "tooltip": "仅用于全局模式。每批投影和前馈处理的 token 数量。减小批量通常可以降低中间显存，但会增加处理开销；它不是空间分块大小，也不是注意力窗口。"}),
+            "highres_weight_cache_gb": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 64.0, "step": 0.5, "tooltip": "仅用于全局流模式。DynamicVRAM 常驻权重缓存上限，单位 GiB；它不是总显存或系统内存。设为 0 会使用自动策略，不会关闭缓存。"}),
         }, "hidden": {"unique_id": "UNIQUE_ID"}}
 
     RETURN_TYPES = ("LATENT",)
@@ -691,27 +691,27 @@ class SelfLiftAvatarH3SpatialAnchoredSampler(SelfLiftAvatarH3Sampler):
             "default": True,
             "label_on": "空间分块：开启",
             "label_off": "空间分块：关闭",
-            "tooltip": "TEST node: spatial tiling only. Disable for a direct full-frame control run.",
+            "tooltip": "测试节点，仅支持空间分块。关闭后可执行完整帧对照。",
         })
         optional["tiling_mode"] = (["manual", "auto"], {
             "default": "manual",
-            "tooltip": "manual is recommended for A/B tests: 2 or 3 strips first; increase only if OOM.",
+            "tooltip": "建议手动进行 A/B 对比：先使用 2 或 3 条带；只有显存不足时再增加数量。",
         })
         optional["tiling_tiles"] = ([2, 3, 4, 6, 8], {
             "default": 2,
-            "tooltip": "Fewer strips preserve more context. 3 can keep a centered subject in one middle strip.",
+            "tooltip": "较少的条带可以保留更多上下文。使用 3 条带时，居中主体可能完整保留在中间条带中。",
         })
         optional["tiling_overlap"] = ("INT", {
             "default": 6, "min": 1, "max": 16, "step": 1,
-            "tooltip": "Explicit overlap in H3 patch units. Larger values give each strip more neighbour context but use more VRAM.",
+            "tooltip": "H3 块单位中的显式重叠范围。数值越大，每个条带获得的邻域上下文越多，但显存占用也会增加。",
         })
         optional["spatial_anchor"] = (["lowres_global", "off"], {
             "default": "lowres_global",
-            "tooltip": "lowres_global appends the aligned full-frame low-resolution endpoint as an uncropped H3 video reference. off is the control path.",
+            "tooltip": "lowres_global 会把对齐后的完整帧高噪声端点作为未裁剪的 H3 视频参考追加到低噪声阶段；off 表示对照路径。",
         })
         optional["highres_tiling_mode"] = (["spatial"], {
             "default": "spatial",
-            "tooltip": "This test node intentionally supports spatial tiling only. Use the original sampler for global modes.",
+            "tooltip": "此测试节点只支持空间分块；需要全局模式时请使用标准采样器。",
         })
         optional.pop("highres_token_chunk", None)
         optional.pop("highres_weight_cache_gb", None)
@@ -807,23 +807,23 @@ class SelfLiftAvatarImageSampler:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "low_res_model": ("MODEL", {"tooltip": "低分辨率阶段使用的模型；高分辨率模型未连接时也用于高分辨率阶段。"}),
+            "low_res_model": ("MODEL", {"tooltip": "高噪声阶段使用的模型。低噪声阶段模型未连接时，也会继续用于低噪声阶段。"}),
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
-            "vae": ("VAE", {"tooltip": "VAE used for the pixel re-encode anchor at the resolution transition."}),
-            "latent_image": ("LATENT", {"tooltip": "Target-resolution image latent. Experimental: accepts existing content and BHW/BCHW Tensor masks. 0 keeps content; 1 generates."}),
-            "sampler": ("SAMPLER", {"tooltip": "支持 ComfyUI 采样器。标准 Euler 且 s_churn=0 时复用切换预测；其他采样器在切换处增加一次低分辨率预测，并重建采样历史。实际兼容性取决于模型和采样器。"}),
+            "vae": ("VAE", {"tooltip": "在噪声阶段切换时，用于像素空间重编码锚点的 VAE。"}),
+            "latent_image": ("LATENT", {"tooltip": "定义目标尺寸的图像潜变量。也支持已有内容以及 BHW/BCHW Tensor 遮罩；0 表示保留内容，1 表示生成内容。"}),
+            "sampler": ("SAMPLER", {"tooltip": "支持 ComfyUI 采样器。标准 Euler 且 s_churn=0 时复用切换预测；其他采样器会在切换处增加一次高噪声阶段预测，并重建采样历史。实际兼容性取决于模型和采样器。"}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
-            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "低分辨率阶段的 sigma 区间数。其他采样器在切换处额外预测一次；多次评估或自适应采样器的模型调用数不等于步数。"}),
-            "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "Spatial scale of the low-resolution prefix (paper: 0.5)."}),
-            "rho": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of locations corrected toward the pixel-VAE anchor. Paper: 0.4 for FLUX.2-Klein, 0.3 for Z-Image-Turbo."}),
+            "transition_step": ("INT", {"default": 6, "min": 1, "max": 10000, "tooltip": "高噪声阶段的 sigma 区间数。其他采样器会在切换处额外预测一次；多次评估或自适应采样器的模型调用数不等于步数。"}),
+            "lowres_scale": ("FLOAT", {"default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05, "tooltip": "高噪声阶段使用的空间尺寸比例，论文默认值为 0.5。"}),
+            "rho": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "向像素 VAE 锚点修正的位置比例。论文设置：FLUX.2-Klein 为 0.4，Z-Image-Turbo 为 0.3。"}),
             "w_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
             "w_max": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-            "latent_upsample": (["nearest", "bilinear"], {"default": "nearest", "tooltip": "Interpolation for the direct latent lift (paper: nearest)."}),
+            "latent_upsample": (["nearest", "bilinear"], {"default": "nearest", "tooltip": "直接提升潜变量时使用的插值方式，论文默认使用最近邻。"}),
         }, "optional": {
-            "high_res_model": ("MODEL", {"tooltip": "高分辨率阶段模型 / High-resolution model. Used after the resolution lift. If disconnected, uses low_res_model. Both stages must use compatible architecture, latent format, sampling parameterization, VAE and conditioning."}),
+            "high_res_model": ("MODEL", {"tooltip": "低噪声阶段使用的模型，在分辨率提升后运行。未连接时使用高噪声阶段模型。两个阶段必须兼容架构、潜变量格式、采样参数化方式、VAE 和条件输入。"}),
         }}
 
     RETURN_TYPES = ("LATENT",)
@@ -845,9 +845,9 @@ class SelfLiftAvatarH3TST:
         return {"required": {
             "model": ("MODEL",),
             "tau": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05,
-                              "tooltip": "Homeostatic correction strength; 0.2 is the paper setting. 0 disables correction while keeping the diagnostic active."}),
+                              "tooltip": "稳态校正强度，论文设置为 0.2。设为 0 会关闭校正，但仍保留诊断功能。"}),
             "log_diagnostics": ("BOOLEAN", {"default": True, "label_on": "诊断日志：开启", "label_off": "诊断日志：关闭",
-                                            "tooltip": "Log per-forward Spectral Tension and correction statistics to the console. Note: TST is skipped with a warning when highres_tiling is enabled on the SelfLift sampler."}),
+                                            "tooltip": "将每次前向计算的 Spectral Tension 和校正统计信息记录到控制台。启用 SelfLift 采样器的低噪声阶段分块时，TST 会发出警告并跳过。"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -866,8 +866,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SelfLiftAvatarH3Sampler": "selflift-Avatar Sampler (MiniMax H3)",
-    "SelfLiftAvatarH3SpatialAnchoredSampler": "selflift-Avatar Spatial Anchor (TEST)",
-    "SelfLiftAvatarImageSampler": "selflift-Avatar Sampler (Image)",
-    "SelfLiftAvatarH3TST": "selflift-Avatar H3 TST",
+    "SelfLiftAvatarH3Sampler": "SelfLift-Avatar｜H3 采样器",
+    "SelfLiftAvatarH3SpatialAnchoredSampler": "SelfLift-Avatar｜空间锚定采样器（测试）",
+    "SelfLiftAvatarImageSampler": "SelfLift-Avatar｜图像采样器",
+    "SelfLiftAvatarH3TST": "SelfLift-Avatar｜H3 时序状态传输校正",
 }

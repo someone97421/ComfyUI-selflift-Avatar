@@ -10,10 +10,10 @@ const SPATIAL_CONTROLS = new Set([
 ]);
 const GLOBAL_CONTROLS = new Set(["highres_token_chunk", "highres_weight_cache_gb"]);
 const MODE_LABELS = {
-    spatial: "Spatial tiling (legacy)",
-    global_stream: "Global stream (recommended)",
-    global: "Global (compatible)",
-    global_ram: "Global RAM (legacy)",
+    spatial: "空间分块（兼容模式）",
+    global_stream: "全局流（推荐）",
+    global: "全局（兼容模式）",
+    global_ram: "全局内存（兼容模式）",
 };
 const originalVisibility = new WeakMap();
 
@@ -32,7 +32,7 @@ function clearSeamDiagram(node) {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = "#888";
     ctx.font = "12px monospace";
-    ctx.fillText("Seam diagnostic: run the TEST node to populate.", 10, 36);
+    ctx.fillText("接缝诊断：运行测试节点后显示。", 10, 36);
 }
 
 function drawSeamDiagram(node, diag) {
@@ -53,7 +53,7 @@ function drawSeamDiagram(node, diag) {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.font = "11px monospace";
     ctx.fillStyle = "#bbb";
-    ctx.fillText(`Seam diagnostic | axis=${axis} | max=${maxValue.toFixed(4)}`, 10, 14);
+    ctx.fillText(`接缝诊断｜轴=${axis}｜最大差异=${maxValue.toFixed(4)}`, 10, 14);
 
     const regions = diag.regions || [];
     if (axis === "W") {
@@ -75,7 +75,7 @@ function drawSeamDiagram(node, diag) {
             ctx.stroke();
         }
         ctx.fillStyle = "#777";
-        ctx.fillText("green < .10   yellow < .25   red >= .25", 10, 57);
+        ctx.fillText("绿色 < .10   黄色 < .25   红色 >= .25", 10, 57);
     } else {
         const x0 = 12, y0 = 22, width = 18, height = canvas.height - 34;
         for (let i = 0; i < regions.length; i++) {
@@ -95,7 +95,7 @@ function drawSeamDiagram(node, diag) {
             ctx.stroke();
         }
         ctx.fillStyle = "#777";
-        ctx.fillText("green < .10   yellow < .25   red >= .25", 42, 38);
+        ctx.fillText("绿色 < .10   黄色 < .25   红色 >= .25", 42, 38);
     }
 }
 
@@ -112,34 +112,37 @@ function memoryMode(node) {
 }
 
 function choices(node) {
-    if (!memoryEnabled(node)) return "设置 / Settings: OFF（高分辨率省显存关闭）";
+    if (!memoryEnabled(node)) return "设置：关闭（低噪声阶段省显存关闭）";
     const m = memoryMode(node);
     if (m === "spatial") {
         const mode = read(node, "tiling_mode", "auto");
+        const axis = read(node, "tiling_axis", "auto");
         const anchor = read(node, "spatial_anchor", null);
         const overlap = read(node, "tiling_overlap", null);
+        const axisLabel = { auto: "自动", width: "宽度", height: "高度" }[axis] ?? axis;
+        const anchorLabel = { lowres_global: "高噪声全局锚点", off: "关闭" }[anchor] ?? anchor;
         const extras = [
-            anchor != null ? `anchor=${anchor}` : null,
-            overlap != null ? `overlap=${overlap}` : null,
-        ].filter(Boolean).join(" | ");
-        const suffix = extras ? ` | ${extras}` : "";
-        return `设置 / Settings: spatial | ${mode} | axis=${read(node, "tiling_axis", "auto")} | tiles=${mode === "manual" ? read(node, "tiling_tiles", 2) : "auto (1–8)"}${suffix}`;
+            anchor != null ? `锚点=${anchorLabel}` : null,
+            overlap != null ? `重叠=${overlap}` : null,
+        ].filter(Boolean).join("｜");
+        const suffix = extras ? `｜${extras}` : "";
+        return `设置：空间分块｜${mode === "manual" ? "手动" : "自动"}｜轴=${axisLabel}｜分块=${mode === "manual" ? read(node, "tiling_tiles", 2) : "自动（1–8）"}${suffix}`;
     }
     const cacheValue = read(node, "highres_weight_cache_gb", 4);
     const cacheText = typeof cacheValue === "number" ? cacheValue.toFixed(1) : cacheValue;
-    const cache = m === "global_stream" ? ` | cache=${cacheText} GiB` : "";
-    return `设置 / Settings: ${m} | token_chunk=${read(node, "highres_token_chunk", 4096)}${cache}`;
+    const cache = m === "global_stream" ? `｜权重缓存=${cacheText} GiB` : "";
+    return `设置：${MODE_LABELS[m] ?? m}｜token 分块=${read(node, "highres_token_chunk", 4096)}${cache}`;
 }
 
 function actualCount(node) {
-    if (!memoryEnabled(node)) return "实际分块数量 / Actual tiles: 关闭，不分块 / OFF";
+    if (!memoryEnabled(node)) return "实际分块数量：关闭，不分块";
     const plan = node.selfliftTilingPlan;
     if (plan?.kind === "global") {
-        return `全局上下文 / Global context: ${plan.mode ?? memoryMode(node)}（无空间块 / no spatial tiles）`;
+        return `全局上下文：${plan.mode ?? memoryMode(node)}（无空间分块）`;
     }
     const count = plan?.tiles;
-    if (!Number.isInteger(count) || count < 1) return "实际分块数量 / Actual tiles: 待估算 / pending (高清准备阶段确定)";
-    return `实际分块数量 / Actual tiles: ${count} 块${count === 1 ? "（整图，不拆分 / no split）" : ""}`;
+    if (!Number.isInteger(count) || count < 1) return "实际分块数量：待估算（低噪声阶段准备时确定）";
+    return `实际分块数量：${count} 块${count === 1 ? "（整图，不拆分）" : ""}`;
 }
 
 function setHidden(widget, hidden) {
@@ -195,7 +198,7 @@ function display(node, text, plan) {
         }
     }
     refreshVisibility(node);
-    box.value = actualCount(node) + "\n" + choices(node) + "\n" + (node.selfliftTilingLast || "未运行 / Not run. Actual plan appears at high-resolution preparation.\nSpatial controls apply only to the spatial mode; token chunk/cache apply only to global modes.");
+    box.value = actualCount(node) + "\n" + choices(node) + "\n" + (node.selfliftTilingLast || "尚未运行。实际方案会在低噪声阶段准备时显示。\n空间控制仅适用于空间模式；token 分块和权重缓存仅适用于全局模式。");
     node.setDirtyCanvas?.(true, true);
 }
 
@@ -211,7 +214,7 @@ app.registerExtension({
             ].includes(nodeData.name);
             const box = document.createElement("textarea");
             box.readOnly = true;
-            box.setAttribute("aria-label", "selflift-Avatar high-resolution memory plan / 高分辨率省显存方案");
+            box.setAttribute("aria-label", "SelfLift-Avatar 低噪声阶段省显存方案");
             box.style.cssText = "width:100%;height:100%;box-sizing:border-box;resize:none;overflow:auto;font:12px/1.45 monospace;color:var(--input-text,#ddd);background:var(--comfy-input-bg,#222);border:1px solid var(--border-color,#555);padding:6px;";
             this.selfliftTilingPanel = box;
             this.addDOMWidget("selflift_tiling_plan", "selflift-tiling-status", box, { serialize: false });
@@ -234,7 +237,7 @@ app.registerExtension({
                 const node = this;
                 widget.callback = function () {
                     const value = callback?.apply(this, arguments);
-                    display(node, "设置已修改 / Settings changed. Run again to compute a new plan.");
+                    display(node, "设置已修改。再次运行以计算新方案。");
                     return value;
                 };
             }
