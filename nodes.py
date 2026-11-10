@@ -35,12 +35,13 @@ from . import avatar_masks
 from .avatar_sampling import native_mask_model
 from . import h3_upscaler
 from . import h3_tiling
+from . import h3_temporal
 from . import spatial_anchor as spatial_anchor_utils
 from .tiling_ui import format_plan
 from . import h3_tst
 from .diagnostics import log_memory
 
-_HIGHRES_TILING_MODES = ("spatial", "global_stream", "global", "global_ram")
+_HIGHRES_TILING_MODES = ("spatial", "temporal", "global_stream", "global", "global_ram")
 _GLOBAL_TILING_MODES = frozenset(("global_stream", "global", "global_ram"))
 
 
@@ -223,7 +224,9 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
                        tiling_axis="auto", on_tiling_plan=None,
                        highres_tiling_mode="spatial", highres_token_chunk=4096,
                        highres_weight_cache_gb=4.0, spatial_anchor_mode="off",
-                       tiling_overlap=None, diagnostics_out=None):
+                       tiling_overlap=None, diagnostics_out=None,
+                       temporal_chunk_frames=124, temporal_overlap_frames=22,
+                       temporal_seam_lock=True):
     _validate_schedule(sigmas, transition_step)
     if sigmas.numel() < 2:
         return latent_image
@@ -263,13 +266,11 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
             avatar_masks.validate_tiling_masks(noise_masks)
             if noise_masks is not None:
                 logging.info("[selflift-Avatar tiling] video=generate, audio=fully preserved; full audio conditioning on every spatial tile")
-        else:
+        elif highres_tiling_mode in _GLOBAL_TILING_MODES:
             if not isinstance(highres_token_chunk, int) or not 128 <= highres_token_chunk <= 16384:
                 raise ValueError("selflift-Avatar: highres_token_chunk must be an integer from 128 to 16384")
             if not 0.0 <= float(highres_weight_cache_gb) <= 64.0:
                 raise ValueError("selflift-Avatar: highres_weight_cache_gb must be between 0 and 64")
-            # Global modes keep the packed sequence intact, so arbitrary video/audio
-            # masks remain valid: no spatial crop or tile-local mask transform is needed.
             logging.info("[selflift-Avatar global] mode=%s token_chunk=%d weight_cache=%.2f GiB; "
                          "full-sequence video/audio masks enabled",
                          highres_tiling_mode, highres_token_chunk, highres_weight_cache_gb)
@@ -281,8 +282,22 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
     streams, nested = _streams(comfy.sample.fix_empty_latent_channels(
         model, latent_image["samples"], latent_image.get("downscale_ratio_spacial", None),
         latent_image.get("downscale_ratio_temporal", None)))
+    temporal_tiling = highres_tiling and highres_tiling_mode == "temporal"
     hires_base = high_res_model if high_res_model is not None else model
     _validate_sampling(hires_base.get_model_object("model_sampling"), sampler)
+    if temporal_tiling:
+        if not isinstance(hires_base.model, comfy.model_base.MiniMaxH3):
+            raise ValueError("时间分块只支持 MiniMax H3 模型。")
+        if not nested or len(streams) != 2 or streams[0].ndim != 5 or streams[1].ndim != 4:
+            raise ValueError("时间分块要求 H3 音视频潜变量。")
+        temporal_plan = h3_temporal.plan_chunks(
+            streams[0].shape[2], streams[1].shape[-1], temporal_chunk_frames, temporal_overlap_frames)
+        h3_temporal.validate_conditioning(hires_base, positive)
+        h3_temporal.validate_conditioning(hires_base, negative)
+        if temporal_seam_lock and len(temporal_plan) > 1 and (
+                not isinstance(sampler, comfy.samplers.KSAMPLER)
+                or type(sampler).sample is not comfy.samplers.KSAMPLER.sample):
+            raise ValueError("时间接缝锁定要求标准 ComfyUI KSAMPLER 接口。")
     reuse_euler = _uses_euler_transition(sampler)
     if not reuse_euler:
         logging.info("[selflift-Avatar sampler] generic transition: one extra low-resolution "
@@ -352,7 +367,8 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
     video_anchor = source_video
     low_latent = _pack([low_video] + audio_streams, nested)
     low_model = native_mask_model(model, [low_video] + audio_streams, low_masks, nested)
-    high_model = native_mask_model(high_model, [video_anchor] + audio_streams, noise_masks, nested)
+    if not temporal_tiling:
+        high_model = native_mask_model(high_model, [video_anchor] + audio_streams, noise_masks, nested)
     del source_video, low_video
     del streams
     noise_low = comfy.sample.prepare_noise(low_latent, seed, latent_image.get("batch_index", None))
@@ -535,17 +551,34 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
         )
     if highres_tiling:
         if highres_tiling_mode == "spatial":
-            logging.info("[selflift-Avatar plan] high-resolution tiling enabled; mode=%s axis=%s", tiling_mode, tiling_axis)
+            logging.info("[selflift-Avatar plan] high-resolution spatial tiling enabled; mode=%s axis=%s", tiling_mode, tiling_axis)
+        elif highres_tiling_mode == "temporal":
+            logging.info("[selflift-Avatar plan] high-resolution temporal tiling enabled; chunk_frames=%d overlap_frames=%d seam_lock=%s",
+                         temporal_chunk_frames, temporal_overlap_frames, temporal_seam_lock)
         else:
             logging.info("[selflift-Avatar plan] high-resolution global context enabled; mode=%s token_chunk=%d "
                          "weight_cache=%.2f GiB; masks remain full-sequence",
                          highres_tiling_mode, highres_token_chunk, highres_weight_cache_gb)
-    out = comfy.samplers.sample(high_model, resume_noise, positive_high, negative, cfg, high_model.load_device,
-                                sampler, sigmas[transition_step:], high_model.model_options,
-                                latent_image=resume_latent, callback=callback_high,
-                                disable_pbar=disable_pbar, seed=seed)
+    if temporal_tiling:
+        def callback_temporal(step, x0, x, total):
+            callback(step + transition_step, x0, x, transition_step + total)
+            high_timer.mark(f"时间窗口采样 {step + 1}/{total}")
+
+        out = h3_temporal.sample(
+            high_model, resume_noise, positive_high, negative, cfg, sampler,
+            sigmas[transition_step:], resume_latent, seed,
+            chunk_frames=temporal_chunk_frames, overlap_frames=temporal_overlap_frames,
+            seam_lock=temporal_seam_lock, disable_pbar=disable_pbar, on_plan=on_tiling_plan,
+            callback=callback_temporal, anchors=[video_anchor] + audio_streams,
+            masks=noise_masks, require_callbacks=reuse_euler,
+        )
+    else:
+        out = comfy.samplers.sample(high_model, resume_noise, positive_high, negative, cfg, high_model.load_device,
+                                    sampler, sigmas[transition_step:], high_model.model_options,
+                                    latent_image=resume_latent, callback=callback_high,
+                                    disable_pbar=disable_pbar, seed=seed)
     del resume_latent, resume_noise, lowres_anchor, positive_high
-    if reuse_euler and high_evaluations != total_steps - transition_step:
+    if reuse_euler and not temporal_tiling and high_evaluations != total_steps - transition_step:
         raise RuntimeError(f"selflift-Avatar: expected {total_steps - transition_step} high-resolution callbacks, received {high_evaluations}; check sampler wrappers")
 
     result = latent_image.copy()
@@ -590,13 +623,16 @@ class SelfLiftAvatarH3Sampler:
             "upscaler_model": _upscaler_input(),
         }, "optional": {
             "high_res_model": ("MODEL", {"tooltip": "低噪声阶段使用的模型，在分辨率提升后运行。未连接时使用高噪声阶段模型。两个阶段必须兼容架构、潜变量格式、采样参数化方式、VAE 和条件输入。"}),
-            "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "低噪声阶段省显存：开启", "label_off": "低噪声阶段省显存：关闭", "tooltip": "实验性的低噪声阶段省显存功能。空间模式会裁剪分块；全局流和全局模式会按完整序列分批处理，并保留跨块注意力上下文。空间模式要求视频遮罩全为 1、音频遮罩全为 0；全局模式保留完整序列遮罩。"}),
+            "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "低噪声阶段省显存：开启", "label_off": "低噪声阶段省显存：关闭", "tooltip": "仅作用于第二段低噪声高分辨率采样。空间模式按宽高分块；时间模式同步切分视频、音频和遮罩；全局模式保留完整上下文并按 token 分批。这些策略互斥。"}),
             "tiling_mode": (["auto", "manual"], {"default": "auto", "tooltip": "仅用于空间模式。auto 自动根据显存估算选择 1 至 8 块；manual 手动使用 tiling_tiles，不会自动增加分块数量。"}),
             "tiling_tiles": ([2, 4, 6, 8], {"default": 2, "tooltip": "仅用于空间模式。手动分块数量可选 2、4、6、8；自动模式会忽略此项。尺寸较小时实际分块数量可能减少。"}),
             "tiling_axis": (["auto", "width", "height"], {"default": "auto", "tooltip": "仅用于空间模式。auto 沿图像块网格较长的一边分块；width 分成左右条带；height 分成上下条带；音频和时间维度不会拆分。"}),
-            "highres_tiling_mode": (["spatial", "global_stream", "global", "global_ram"], {"default": "spatial", "tooltip": "省显存策略。spatial 使用带完整高噪声锚点的空间分块、内容感知切线和接缝诊断；global_stream 保留完整序列上下文并分组处理 GPU 注意力头，需要原生 SLA/sol-attn 支持；global 使用兼容性更高的完整序列路径，但显存占用更大；global_ram 使用主机内存分批处理，速度更慢。全局模式会保留打包序列中的完整音视频遮罩。"}),
-            "highres_token_chunk": ("INT", {"default": 4096, "min": 128, "max": 16384, "step": 128, "tooltip": "仅用于全局模式。每批投影和前馈处理的 token 数量。减小批量通常可以降低中间显存，但会增加处理开销；它不是空间分块大小，也不是注意力窗口。"}),
+            "highres_tiling_mode": (["spatial", "temporal", "global_stream", "global", "global_ram"], {"default": "spatial", "tooltip": "省显存策略。spatial 进行空间分块；temporal 在低噪声阶段按 H3 时间窗口分块并融合重叠帧；global_stream、global 和 global_ram 保留完整序列上下文并按 token 分批。"}),
+            "highres_token_chunk": ("INT", {"default": 4096, "min": 128, "max": 16384, "step": 128, "tooltip": "仅用于全局模式。每批投影和前馈处理的 token 数量。减小批量通常可以降低中间显存，但会增加处理开销；它不是空间分块大小，也不是时间窗口。"}),
             "highres_weight_cache_gb": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 64.0, "step": 0.5, "tooltip": "仅用于全局流模式。DynamicVRAM 常驻权重缓存上限，单位 GiB；它不是总显存或系统内存。设为 0 会使用自动策略，不会关闭缓存。"}),
+            "temporal_chunk_frames": ("INT", {"default": 124, "min": 22, "max": 3592, "step": 17, "tooltip": "仅用于时间模式。窗口长度，单位为视频像素帧，采用 17k+5 网格；124 帧在 24 帧率下约为 5.17 秒。可使用 56、73、90、107、124 等值。窗口越短，单次前向的显存占用通常越小。"}),
+            "temporal_overlap_frames": ("INT", {"default": 22, "min": 5, "max": 107, "step": 17, "tooltip": "仅用于时间模式。相邻窗口重叠的像素帧数，采用 17k+5 网格，且必须小于窗口长度。重叠区线性融合，音频按整段的绝对时间边界同步切分。"}),
+            "temporal_seam_lock": ("BOOLEAN", {"default": True, "label_on": "时间接缝锁定：开启", "label_off": "时间接缝锁定：关闭", "tooltip": "仅用于时间模式。固定后续窗口开头的 2 个视频 latent（局部 5 个像素帧），锚定到已生成的重叠内容；用户原本要求保留的区域优先。需要标准 ComfyUI KSAMPLER，不锁定音频。"}),
         }, "hidden": {"unique_id": "UNIQUE_ID"}}
 
     RETURN_TYPES = ("LATENT",)
@@ -607,7 +643,8 @@ class SelfLiftAvatarH3Sampler:
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, high_res_model=None, highres_tiling=False,
                tiling_mode="auto", tiling_tiles=2, tiling_axis="auto",
                highres_tiling_mode="spatial", highres_token_chunk=4096,
-               highres_weight_cache_gb=4.0, unique_id=None):
+               highres_weight_cache_gb=4.0, unique_id=None,
+               temporal_chunk_frames=124, temporal_overlap_frames=22, temporal_seam_lock=True):
         if rho == 0.0 and upscaler_model == "none":
             raise ValueError(
                 "SelfLift H3: rho=0 with upscaler_model=none disables both SelfLift-zero correction "
@@ -619,14 +656,17 @@ class SelfLiftAvatarH3Sampler:
                 logging.warning("SelfLift H3: rho > 0 with an external upscaler is a hybrid experiment; select upscaler_model=none to test the paper's SelfLift-zero direct route")
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model)
         if not highres_tiling:
-            summary = "OFF / 高分辨率省显存已关闭"
+            summary = "OFF / 低噪声阶段省显存已关闭"
         elif highres_tiling_mode == "spatial":
-            summary = "Preparing / 准备中: spatial + full-frame low-res anchor | {} | axis={} | tiles={}\nActual plan appears at high-resolution preparation / 高清阶段准备时显示实际方案".format(
-                tiling_mode, tiling_axis, tiling_tiles if tiling_mode == "manual" else "auto")
+            summary = "准备中：空间分块｜模式={}｜轴={}｜分块={}".format(
+                tiling_mode, tiling_axis, tiling_tiles if tiling_mode == "manual" else "自动")
+        elif highres_tiling_mode == "temporal":
+            summary = "准备中：时间分块｜窗口={} 帧｜重叠={} 帧｜接缝锁定={}".format(
+                temporal_chunk_frames, temporal_overlap_frames, "开启" if temporal_seam_lock else "关闭")
         else:
-            cache = (f" | weight_cache={float(highres_weight_cache_gb):.1f} GiB"
+            cache = (f"｜权重缓存={float(highres_weight_cache_gb):.1f} GiB"
                      if highres_tiling_mode == "global_stream" else "")
-            summary = "Preparing / 准备中: {} | token_chunk={}{}\nFull-sequence masks / 全序列遮罩: enabled".format(
+            summary = "准备中：{}｜token 分块={}{}".format(
                 highres_tiling_mode, highres_token_chunk, cache)
         last_plan = None
 
@@ -656,7 +696,10 @@ class SelfLiftAvatarH3Sampler:
                                         highres_weight_cache_gb=highres_weight_cache_gb,
                                         spatial_anchor_mode=spatial_anchor_mode,
                                         tiling_overlap=spatial_overlap,
-                                        diagnostics_out=diagnostics)
+                                        diagnostics_out=diagnostics,
+                                        temporal_chunk_frames=temporal_chunk_frames,
+                                        temporal_overlap_frames=temporal_overlap_frames,
+                                        temporal_seam_lock=temporal_seam_lock)
         except Exception:
             send_status("FAILED / 运行失败：以下不是成功结果；详见错误报告\n" + summary)
             raise
@@ -715,6 +758,9 @@ class SelfLiftAvatarH3SpatialAnchoredSampler(SelfLiftAvatarH3Sampler):
         })
         optional.pop("highres_token_chunk", None)
         optional.pop("highres_weight_cache_gb", None)
+        optional.pop("temporal_chunk_frames", None)
+        optional.pop("temporal_overlap_frames", None)
+        optional.pop("temporal_seam_lock", None)
         return schema
 
     def sample(self, low_res_model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,

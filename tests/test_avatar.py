@@ -20,7 +20,7 @@ spec = importlib.util.spec_from_file_location('selflift_avatar_test', PLUGIN/'__
 plugin = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
-from selflift_avatar_test import nodes, avatar_masks as masks, selflift, avatar_sampling, h3_tiling, h3_global_tiling, h3_output_chunking, h3_upscaler, spatial_anchor
+from selflift_avatar_test import nodes, avatar_masks as masks, selflift, avatar_sampling, h3_tiling, h3_temporal, h3_global_tiling, h3_output_chunking, h3_upscaler, spatial_anchor
 import torch
 import comfy.latent_formats
 import comfy.ldm.minimax.model
@@ -367,6 +367,33 @@ class PipelineTests(unittest.TestCase):
             return nodes.progressive_sample(low_res_model,[],[],None,latent,
                 sampler if sampler is not None else comfy.samplers.sampler_object('euler'),
                 torch.tensor([1.,.75,.5,.25,0.]),42,1.,2,.5,rho,1.,1.,'nearest',highres_tiling=tiling, **tiling_options)
+    def test_temporal_only_splits_second_stage(self):
+        self.v = torch.randn(2, 24, 12, 8, 8)
+        self.a = torch.randn(2, 32, 2, 65)
+        plain = self.run_pipeline(None)['samples'].unbind()
+        split = self.run_pipeline(None, tiling=True, highres_tiling_mode='temporal',
+                                  temporal_chunk_frames=22, temporal_overlap_frames=5,
+                                  temporal_seam_lock=False)['samples'].unbind()
+        self.assertEqual(self.stages, [2, 2, 2, 2, 2])
+        self.assertEqual([s[2] for s in self.stage_shapes[-3:]], [12, 7, 7])
+        for schedule in self.stage_sigmas[-2:]:
+            torch.testing.assert_close(schedule, torch.tensor([.5, .25, 0.]))
+        for expected, actual in zip(plain, split):
+            torch.testing.assert_close(actual, expected)
+
+    def test_temporal_seam_lock_preserves_original_audio_and_host_options(self):
+        self.v = torch.randn(2, 24, 12, 8, 8)
+        self.a = torch.randn(2, 32, 2, 65)
+        high = Patcher()
+        mask = NestedTensor([torch.ones_like(self.v), torch.zeros_like(self.a)])
+        out = self.run_pipeline(mask, tiling=True, high_res_model=high,
+                                highres_tiling_mode='temporal', temporal_chunk_frames=22,
+                                temporal_overlap_frames=5, temporal_seam_lock=True)
+        self.assertEqual(self.stages, [2, 2, 2])
+        torch.testing.assert_close(out['samples'].unbind()[1], self.a, rtol=0, atol=0)
+        self.assertEqual(high.model_options, {})
+        self.assertEqual(out['tag'], 'preserved')
+
     def check_generic_transition(self, sampler, expected_callbacks=(2,1,2), mask=None, tiling=False):
         inputs, outputs = [], []
         original_sample = self.sample
@@ -865,6 +892,94 @@ class GlobalChunkingTests(unittest.TestCase):
 
 
 class TilingTests(unittest.TestCase):
+    def test_temporal_plan_covers_av_latent_with_h3_overlap(self):
+        plan = h3_temporal.plan_chunks(12, 14, chunk_frames=22, overlap_frames=5)
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(plan[0]["video_start"], 0)
+        self.assertEqual(plan[-1]["video_end"], 12)
+        self.assertEqual(plan[0]["audio_start"], 0)
+        self.assertEqual(plan[-1]["audio_end"], 14)
+        self.assertEqual(plan[1]["video_start"], 5)
+        self.assertEqual(plan[1]["context_video_t"], 2)
+
+    def test_temporal_windows_blend_back_to_full_av_latent(self):
+        video = torch.zeros(1, 24, 12, 4, 4)
+        audio = torch.zeros(1, 32, 2, 14)
+        latent = NestedTensor([video, audio])
+        noise = NestedTensor([torch.zeros_like(video), torch.zeros_like(audio)])
+        calls = []
+
+        def sample(model, noise, positive, negative, cfg, device, sampler, sigmas, options,
+                   latent_image, **kwargs):
+            streams = latent_image.unbind()
+            calls.append([tuple(stream.shape) for stream in streams])
+            return NestedTensor([streams[0] + 1, streams[1] + 2])
+
+        with patch.object(nodes.comfy.samplers, "sample", side_effect=sample):
+            out = h3_temporal.sample(
+                Patcher(), noise, [], [], 1.0, None, torch.tensor([1.0, 0.0]), latent,
+                7, chunk_frames=22, overlap_frames=5, seam_lock=False,
+            )
+        result_video, result_audio = out.unbind()
+        torch.testing.assert_close(result_video, torch.ones_like(video))
+        torch.testing.assert_close(result_audio, torch.full_like(audio, 2))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0][2], 7)
+        self.assertEqual(calls[1][0][2], 7)
+
+    def test_temporal_nonconstant_overlap_and_progress(self):
+        latent = NestedTensor([torch.zeros(1, 24, 12, 4, 4), torch.zeros(1, 32, 2, 14)])
+        progress = []
+        count = 0
+        def sample(*args, latent_image, callback, **kwargs):
+            nonlocal count
+            count += 1
+            result = NestedTensor([s + (1 if count == 1 else 3) for s in latent_image.unbind()])
+            callback(0, result, result, 1)
+            return result
+        with patch.object(nodes.comfy.samplers, 'sample', side_effect=sample):
+            out = h3_temporal.sample(Patcher(), latent, [], [], 1., None,
+                                     torch.tensor([.5, 0.]), latent, 7,
+                                     chunk_frames=22, overlap_frames=5, seam_lock=False,
+                                     callback=lambda step, x0, x, total: progress.append((step, total)))
+        video = out.unbind()[0]
+        self.assertAlmostEqual(video[0, 0, 5, 0, 0].item(), 1.5)
+        self.assertAlmostEqual(video[0, 0, 6, 0, 0].item(), 2.5)
+        self.assertEqual(progress, [(0, 2), (1, 2)])
+
+    def test_temporal_native_guides_are_cropped_without_mutation(self):
+        video = torch.randn(1, 24, 12, 4, 4)
+        audio = torch.randn(1, 32, 2, 65)
+        reference = {'kind': 'image', 'latent': torch.randn(1, 24, 1, 4, 4)}
+        cond = [[torch.zeros(1, 2, 4), {'minimax_keyframes': [
+            {'resolved_frame_index': 0, 'latent': video, 'audio_latent': audio}],
+            'minimax_refs': [reference]}]]
+        model = Patcher()
+        h3_temporal.validate_conditioning(model, cond)
+        chunk = h3_temporal.plan_chunks(12, 65, 22, 5)[1]
+        values = h3_temporal._slice_conditioning(model, cond, chunk, 12)[0][1]
+        guides = values['minimax_keyframes']
+        torch.testing.assert_close(next(g['latent'] for g in guides if 'latent' in g), video[:, :, 5:])
+        torch.testing.assert_close(next(g['audio_latent'] for g in guides if 'audio_latent' in g), audio[..., 28:])
+        self.assertTrue(all(g['resolved_frame_index'] == 0 for g in guides))
+        self.assertIs(values['minimax_refs'][0], reference)
+        self.assertEqual(cond[0][1]['minimax_keyframes'][0]['latent'].shape[2], 12)
+
+    def test_temporal_many_windows_cover_audio_absolute_boundaries(self):
+        plan = h3_temporal.plan_chunks(42, 231, 39, 22)
+        self.assertGreater(len(plan), 3)
+        self.assertEqual(plan[-1]['video_end'], 42)
+        self.assertEqual(plan[-1]['audio_end'], 231)
+        for window in plan:
+            self.assertEqual(window['video_start'] % 5, 0)
+            self.assertEqual((window['video_end'] - window['video_start'] - 2) % 5, 0)
+            self.assertEqual(window['audio_start'], round(window['frame_start'] * 231 / 141))
+
+    def test_temporal_invalid_parameters_fail_before_sampling(self):
+        for args in [(12, 65, 22, 22), (12, 65, 23, 5), (3, 65, 22, 5)]:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                h3_temporal.plan_chunks(*args)
+
     def test_mask_gate(self):
         masks.validate_tiling_masks(None)
         masks.validate_tiling_masks([torch.ones(1,1,1,1,1),torch.zeros(1,1,1,1)])
@@ -1006,11 +1121,14 @@ class SpatialAnchorTests(unittest.TestCase):
         original = nodes.SelfLiftAvatarH3Sampler.INPUT_TYPES()
         test_node = nodes.SelfLiftAvatarH3SpatialAnchoredSampler.INPUT_TYPES()
         self.assertEqual(original["optional"]["highres_tiling_mode"][0],
-                         ["spatial", "global_stream", "global", "global_ram"])
+                         ["spatial", "temporal", "global_stream", "global", "global_ram"])
         self.assertEqual(test_node["optional"]["highres_tiling_mode"][0], ["spatial"])
         self.assertEqual(test_node["optional"]["spatial_anchor"][1]["default"], "lowres_global")
         self.assertEqual(test_node["optional"]["tiling_tiles"][0], [2, 3, 4, 6, 8])
         self.assertEqual(test_node["optional"]["tiling_overlap"][1]["default"], 6)
+        self.assertNotIn('temporal_chunk_frames', test_node['optional'])
+        self.assertNotIn('temporal_overlap_frames', test_node['optional'])
+        self.assertNotIn('temporal_seam_lock', test_node['optional'])
 
     def test_test_node_forwards_anchor_and_overlap_to_engine(self):
         output = {"samples": torch.zeros(1)}
@@ -1122,7 +1240,10 @@ class TilingControlTests(unittest.TestCase):
         self.assertEqual(schema['optional']['tiling_axis'][1]['default'],'auto')
         self.assertEqual(schema['optional']['highres_tiling_mode'][1]['default'],'spatial')
         self.assertEqual(schema['optional']['highres_tiling_mode'][0],
-                         ['spatial','global_stream','global','global_ram'])
+                         ['spatial','temporal','global_stream','global','global_ram'])
+        self.assertEqual(schema['optional']['temporal_chunk_frames'][1]['default'],124)
+        self.assertEqual(schema['optional']['temporal_overlap_frames'][1]['default'],22)
+        self.assertTrue(schema['optional']['temporal_seam_lock'][1]['default'])
         self.assertEqual(schema['optional']['highres_token_chunk'][1]['default'],4096)
         self.assertEqual(schema['optional']['highres_weight_cache_gb'][1]['default'],4.0)
         self.assertEqual(schema['hidden']['unique_id'],'UNIQUE_ID')

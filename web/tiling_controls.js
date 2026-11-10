@@ -4,17 +4,72 @@ import { api } from "../../scripts/api.js";
 const CONTROL_NAMES = new Set([
     "highres_tiling", "highres_tiling_mode", "tiling_mode", "tiling_tiles", "tiling_axis",
     "tiling_overlap", "spatial_anchor", "highres_token_chunk", "highres_weight_cache_gb",
+    "temporal_chunk_frames", "temporal_overlap_frames", "temporal_seam_lock",
 ]);
 const SPATIAL_CONTROLS = new Set([
     "tiling_mode", "tiling_tiles", "tiling_axis", "tiling_overlap", "spatial_anchor",
 ]);
+const TEMPORAL_CONTROLS = new Set(["temporal_chunk_frames", "temporal_overlap_frames", "temporal_seam_lock"]);
 const GLOBAL_CONTROLS = new Set(["highres_token_chunk", "highres_weight_cache_gb"]);
 const MODE_LABELS = {
     spatial: "空间分块（兼容模式）",
+    temporal: "时间分块（实验）",
     global_stream: "全局流（推荐）",
     global: "全局（兼容模式）",
     global_ram: "全局内存（兼容模式）",
 };
+const WIDGET_LABELS = {
+    seed: "随机种子", cfg: "提示词引导", transition_step: "阶段切换步数",
+    lowres_scale: "高噪声缩放", rho: "像素校正强度",
+    w_min: "最小校正权重", w_max: "最大校正权重", upscaler_model: "潜变量放大模型",
+    highres_tiling: "低噪声省显存", highres_tiling_mode: "省显存策略",
+    tiling_mode: "分块方式", tiling_tiles: "空间分块数量", tiling_axis: "空间分块方向",
+    tiling_overlap: "空间重叠比例", spatial_anchor: "空间锚点",
+    highres_token_chunk: "Token 分块大小", highres_weight_cache_gb: "权重缓存 GiB",
+    temporal_chunk_frames: "时间窗口帧数", temporal_overlap_frames: "时间重叠帧数",
+    temporal_seam_lock: "时间接缝锁定",
+};
+const OPTION_LABELS = {
+    highres_tiling_mode: MODE_LABELS,
+    tiling_mode: { auto: "自动", manual: "手动" },
+    tiling_axis: { auto: "自动", width: "宽度", height: "高度" },
+    spatial_anchor: { off: "关闭", lowres_global: "高噪声全局锚点" },
+};
+
+function localizeWidget(widget) {
+    const label = WIDGET_LABELS[widget.name];
+    if (label) widget.label = label;
+    if (["highres_tiling", "temporal_seam_lock"].includes(widget.name)) {
+        widget.options = { ...widget.options, on: "开启", off: "关闭" };
+    }
+    const labels = OPTION_LABELS[widget.name];
+    if (!labels || !widget.options) return;
+    widget.options = { ...widget.options, getOptionLabel: (value) => labels[value] ?? value };
+    const onClick = widget.onClick;
+    if (typeof onClick !== "function" || typeof widget.setValue !== "function") return;
+    widget.onClick = function (eventOptions) {
+        const { e, node, canvas } = eventOptions;
+        const x = e.canvasX - node.pos[0];
+        const width = this.width || node.size[0];
+        const Menu = globalThis.LiteGraph?.ContextMenu;
+        const values = this.options.values;
+        if (x < 40 || x > width - 40 || !Menu || !Array.isArray(values)) {
+            return onClick.apply(this, arguments);
+        }
+        const menuLabels = values.map((value) => labels[value] ?? String(value));
+        const menu = new Menu(menuLabels, {
+            scale: Math.max(1, canvas.ds.scale), event: e, className: "dark", node,
+            callback: (item) => {
+                const selected = typeof item === "object" && item !== null
+                    ? item.value ?? item.content : item;
+                const value = values.includes(selected) ? selected
+                    : values[menuLabels.indexOf(selected)];
+                if (value !== undefined) this.setValue(value, eventOptions);
+            },
+        });
+        if (menu.root) menu.root.style.whiteSpace = "nowrap";
+    };
+}
 const originalVisibility = new WeakMap();
 
 function seamColor(value) {
@@ -128,6 +183,9 @@ function choices(node) {
         const suffix = extras ? `｜${extras}` : "";
         return `设置：空间分块｜${mode === "manual" ? "手动" : "自动"}｜轴=${axisLabel}｜分块=${mode === "manual" ? read(node, "tiling_tiles", 2) : "自动（1–8）"}${suffix}`;
     }
+    if (m === "temporal") {
+        return `设置：时间分块｜窗口=${read(node, "temporal_chunk_frames", 124)} 帧｜重叠=${read(node, "temporal_overlap_frames", 22)} 帧｜接缝锁定=${read(node, "temporal_seam_lock", true) ? "开启" : "关闭"}`;
+    }
     const cacheValue = read(node, "highres_weight_cache_gb", 4);
     const cacheText = typeof cacheValue === "number" ? cacheValue.toFixed(1) : cacheValue;
     const cache = m === "global_stream" ? `｜权重缓存=${cacheText} GiB` : "";
@@ -137,6 +195,9 @@ function choices(node) {
 function actualCount(node) {
     if (!memoryEnabled(node)) return "实际分块数量：关闭，不分块";
     const plan = node.selfliftTilingPlan;
+    if (plan?.kind === "temporal") {
+        return `时间分块：${plan.chunks ?? "?"} 段｜窗口=${plan.chunk_frames ?? "?"} 帧｜重叠=${plan.overlap_frames ?? "?"} 帧`;
+    }
     if (plan?.kind === "global") {
         return `全局上下文：${plan.mode ?? memoryMode(node)}（无空间分块）`;
     }
@@ -146,6 +207,7 @@ function actualCount(node) {
 }
 
 function setHidden(widget, hidden) {
+    const wasHidden = "hidden" in widget ? widget.hidden : widget.type === "selflift-hidden";
     if (!originalVisibility.has(widget)) {
         originalVisibility.set(widget, { type: widget.type, computeSize: widget.computeSize });
     }
@@ -155,28 +217,37 @@ function setHidden(widget, hidden) {
         widget.type = hidden ? "selflift-hidden" : original.type;
         widget.computeSize = hidden ? () => [0, -4] : original.computeSize;
     }
+    return wasHidden !== hidden;
 }
 
 function refreshVisibility(node) {
     const on = memoryEnabled(node);
     const m = memoryMode(node);
+    const previousHeight = node.computeSize()[1];
+    let changed = false;
     for (const widget of node.widgets || []) {
         if (!CONTROL_NAMES.has(widget.name) || widget.name === "highres_tiling") continue;
         // Converted widget inputs are owned by ComfyUI; do not alter their visibility.
         if (String(widget.type).startsWith("converted-widget")) continue;
         const linked = node.inputs?.some((slot) => slot.widget?.name === widget.name && slot.link != null);
         if (linked) {
-            setHidden(widget, false);
+            changed = setHidden(widget, false) || changed;
             continue;
         }
         let hidden = false;
         if (!on) hidden = true;
-        else if (m === "spatial") hidden = GLOBAL_CONTROLS.has(widget.name);
+        else if (m === "spatial") hidden = GLOBAL_CONTROLS.has(widget.name) || TEMPORAL_CONTROLS.has(widget.name);
+        else if (m === "temporal") hidden = SPATIAL_CONTROLS.has(widget.name) || GLOBAL_CONTROLS.has(widget.name);
         else {
             hidden = SPATIAL_CONTROLS.has(widget.name)
+                || TEMPORAL_CONTROLS.has(widget.name)
                 || (widget.name === "highres_weight_cache_gb" && m !== "global_stream");
         }
-        setHidden(widget, hidden);
+        changed = setHidden(widget, hidden) || changed;
+    }
+    if (changed && typeof node.setSize === "function") {
+        const minimumHeight = node.computeSize()[1];
+        node.setSize([node.size[0], Math.max(minimumHeight, node.size[1] + minimumHeight - previousHeight)]);
     }
     node.setDirtyCanvas?.(true, true);
 }
@@ -198,7 +269,7 @@ function display(node, text, plan) {
         }
     }
     refreshVisibility(node);
-    box.value = actualCount(node) + "\n" + choices(node) + "\n" + (node.selfliftTilingLast || "尚未运行。实际方案会在低噪声阶段准备时显示。\n空间控制仅适用于空间模式；token 分块和权重缓存仅适用于全局模式。");
+    box.value = actualCount(node) + "\n" + choices(node) + "\n" + (node.selfliftTilingLast || "尚未运行。实际方案会在低噪声阶段准备时显示。\n空间控制仅适用于空间模式；时间窗口和接缝锁定仅适用于时间模式；token 分块和权重缓存仅适用于全局模式。");
     node.setDirtyCanvas?.(true, true);
 }
 
@@ -229,9 +300,7 @@ app.registerExtension({
                 clearSeamDiagram(this);
             }
             for (const widget of this.widgets || []) {
-                if (widget.name === "highres_tiling_mode" && widget.options) {
-                    widget.options.getOptionLabel = (value) => MODE_LABELS[value] ?? value;
-                }
+                localizeWidget(widget);
                 if (!CONTROL_NAMES.has(widget.name)) continue;
                 const callback = widget.callback;
                 const node = this;

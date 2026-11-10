@@ -2,6 +2,16 @@
 
 
 def format_plan(plan):
+    if plan.get("kind") == "temporal":
+        return "\n".join([
+            f"时间分块数量：{plan.get('chunks', '?')}",
+            f"时间窗口：{plan.get('chunk_frames', '?')} 帧；重叠：{plan.get('overlap_frames', '?')} 帧",
+            f"接缝锁定：{'开启' if plan.get('seam_lock') else '关闭'}",
+            f"视频潜变量：{plan.get('video_shape', '?')}",
+            f"音频潜变量：{plan.get('audio_shape', '?')}",
+            "仅作用于低噪声阶段；每个窗口使用完整的第二阶段 sigma 日程",
+        ])
+
     if plan.get("kind") == "global":
         mode = plan.get("mode", "global")
         lines = [
