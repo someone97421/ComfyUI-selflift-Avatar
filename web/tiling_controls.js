@@ -72,6 +72,33 @@ function localizeWidget(widget) {
 }
 const originalVisibility = new WeakMap();
 
+function positionTilingStrategy(node) {
+    const widgets = node.widgets;
+    const strategy = widgets?.find((widget) => widget.name === "highres_tiling_mode");
+    const toggle = widgets?.find((widget) => widget.name === "highres_tiling");
+    if (!strategy || !toggle) return;
+    widgets.splice(widgets.indexOf(strategy), 1);
+    widgets.splice(widgets.indexOf(toggle) + 1, 0, strategy);
+}
+
+function installTilingOrder(node) {
+    const originalOrder = new Map(node.widgets.map((widget, index) => [widget, index]));
+    for (const method of ["serialize", "configure"]) {
+        const original = node[method];
+        if (typeof original !== "function") continue;
+        node[method] = function () {
+            // 旧工作流的 widgets_values 按原始位置保存，不能跟随显示顺序移动。
+            this.widgets.sort((a, b) => (originalOrder.get(a) ?? Infinity) - (originalOrder.get(b) ?? Infinity));
+            try {
+                return original.apply(this, arguments);
+            } finally {
+                positionTilingStrategy(this);
+            }
+        };
+    }
+    positionTilingStrategy(node);
+}
+
 function seamColor(value) {
     if (value <= 0.10) return "#38c172";
     if (value <= 0.25) return "#f0ad4e";
@@ -310,6 +337,7 @@ app.registerExtension({
                     return value;
                 };
             }
+            installTilingOrder(this);
             this.size[0] = Math.max(this.size[0], 370);
             this.size[1] = Math.max(this.size[1], this.computeSize()[1] + 170);
             display(this);

@@ -1,5 +1,10 @@
 # selflift-Avatar
 
+## 鸣谢
+
+- [slmonker/selflift-Avatar](https://github.com/slmonker/selflift-Avatar)：本项目以其 SelfLift 两阶段升分辨率采样实现为基础，沿用 H3 音视频潜变量遮罩与原始音频保留机制。
+- [ehsrzv/comfyui-h3_temporal_sampler](https://github.com/ehsrzv/comfyui-h3_temporal_sampler)：第二阶段时间分块借鉴其音视频重叠窗口采样、重叠融合及通过去噪遮罩锁定接缝的思路。
+
 **Development: `main` (global-context memory saving + long-clip upscaler fix)** · **Packaged release: `v0.1.4-experimental`** · [中文说明](README_CN.md) · [Changelog](CHANGELOG.md) · [v0.1.4 release](https://github.com/slmonker/selflift-Avatar/releases/tag/v0.1.4-experimental)
 
 An independent experimental SelfLift branch for ComfyUI / MiniMax H3. It focuses on H3 audio-video latent masks, preserving source audio during sampling, and high-resolution spatial tiling / global-context memory saving. It registers separate node IDs, so it can coexist with the original SelfLift plugin.

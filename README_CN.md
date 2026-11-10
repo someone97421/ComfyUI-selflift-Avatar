@@ -1,5 +1,10 @@
 # selflift-Avatar
 
+## 鸣谢
+
+- [slmonker/selflift-Avatar](https://github.com/slmonker/selflift-Avatar)：本项目以其 SelfLift 两阶段升分辨率采样实现为基础，沿用 H3 音视频潜变量遮罩与原始音频保留机制。
+- [ehsrzv/comfyui-h3_temporal_sampler](https://github.com/ehsrzv/comfyui-h3_temporal_sampler)：第二阶段时间分块借鉴其音视频重叠窗口采样、重叠融合及通过去噪遮罩锁定接缝的思路。
+
 **开发版：`main`（全局上下文省显存 + 长视频 latent upscaler 修复）** · **已打包版本：`v0.1.4-experimental`** · [English README](README.md) · [更新记录](CHANGELOG.md) · [v0.1.4 发布页](https://github.com/slmonker/selflift-Avatar/releases/tag/v0.1.4-experimental)
 
 这是一个面向 ComfyUI / MiniMax H3 的 SelfLift 独立实验分支，重点处理 H3 音视频 latent 遮罩、采样过程中的原始音频保留，以及高分辨率空间分块 / 全局上下文省显存。它使用独立的节点 ID，可以和原版 SelfLift 共存。
